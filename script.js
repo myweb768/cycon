@@ -1,7 +1,15 @@
-// frontend/script.js - FULLY CORRECTED VERSION
+// frontend/script.js - FULLY FIXED VERSION
+// Fixes:
+// 1. onicecandidate defined twice (overwrite bug) → merged into one
+// 2. Key generation feedback added
+// 3. Chat DataChannel readyState check improved
+// 4. Timer starts correctly for both audio and video
+// 5. accept_call flow fixed (caller gets media before sending offer)
+// 6. peer_left cleanup order fixed
+// 7. Renegotiation guard added to prevent duplicate offers
 
 // =================================================================
-// GLOBALS & LANGUAGE 
+// GLOBALS & LANGUAGE
 // =================================================================
 const socket = io();
 let sessionKey = null;
@@ -12,6 +20,7 @@ let isCaller = false;
 let currentCallType = null;
 let callRinger = null;
 let currentVideoConstraint = 'user';
+let isNegotiating = false; // FIX: guard against duplicate offers
 
 // Timer Globals
 let timerInterval = null;
@@ -57,60 +66,48 @@ const callControlsBar = document.getElementById('callControlsBar');
 const callTimer = document.getElementById('callTimer');
 
 // =================================================================
-// UI & Call Control Helpers 
+// UI & Call Control Helpers
 // =================================================================
 
 function startRinging() {
-    if (!callRinger) {
-        // Create classic phone ringing sound using Web Audio API
+    if (callRinger) return; // already ringing
+    try {
         const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        
-        // Create a buffer for the ringing pattern
         const sampleRate = audioContext.sampleRate;
-        const ringDuration = 2; // 2 seconds per ring cycle
+        const ringDuration = 2;
         const buffer = audioContext.createBuffer(1, sampleRate * ringDuration, sampleRate);
         const data = buffer.getChannelData(0);
-        
-        // Generate classic dual-tone ring (440Hz + 480Hz)
+
         for (let i = 0; i < buffer.length; i++) {
             const time = i / sampleRate;
-            
-            // Ring pattern: 1 second on, 1 second off
             if (time < 1.0) {
-                // Mix two frequencies for classic phone ring sound
-                const tone1 = Math.sin(2 * Math.PI * 440 * time); // A4 note
-                const tone2 = Math.sin(2 * Math.PI * 480 * time); // Close to B4
-                
-                // Add vibrato effect for more realistic sound
+                const tone1 = Math.sin(2 * Math.PI * 440 * time);
+                const tone2 = Math.sin(2 * Math.PI * 480 * time);
                 const vibrato = Math.sin(2 * Math.PI * 2 * time) * 0.1;
-                
-                // Envelope for smooth attack and decay
                 const envelope = Math.sin(Math.PI * time);
-                
                 data[i] = ((tone1 + tone2) / 2) * envelope * (1 + vibrato) * 0.3;
             } else {
-                data[i] = 0; // Silence during off period
+                data[i] = 0;
             }
         }
-        
-        // Create source and connect it
+
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
         source.loop = true;
         source.connect(audioContext.destination);
         source.start(0);
-        
-        // Store reference for stopping later
         callRinger = { source, audioContext };
+    } catch (e) {
+        console.warn('Ringing failed:', e);
     }
 }
 
 function stopRinging() {
     if (callRinger) {
-        if (callRinger.source) {
+        try {
             callRinger.source.stop();
             callRinger.audioContext.close();
-        }
+        } catch (e) { /* ignore */ }
         callRinger = null;
     }
 }
@@ -121,19 +118,15 @@ function showVideoArea() {
 }
 
 function hideVideoArea() {
-    // Exit fullscreen if active
     if (document.fullscreenElement) {
         document.exitFullscreen().catch(e => console.warn('Exit fullscreen failed:', e));
     }
-
-    // Hide video elements
     if (localVideo) localVideo.style.display = 'none';
     if (remoteVideo) remoteVideo.style.display = 'none';
     if (videoCol) {
         videoCol.style.display = 'none';
         videoCol.classList.remove('maximized');
     }
-    
     if (callControlsBar) callControlsBar.hidden = true;
     if (muteMicButton) muteMicButton.hidden = true;
     if (endCallButton) endCallButton.hidden = true;
@@ -155,9 +148,7 @@ function hideCallControls() {
 }
 
 function startTimer() {
-    // Don't start timer if not in an active call
-    if (!currentCallType) return;
-    
+    if (timerInterval) return; // FIX: don't start if already running
     secondsElapsed = 0;
     if (callTimer) callTimer.hidden = false;
 
@@ -169,13 +160,13 @@ function startTimer() {
         if (callTimer) callTimer.textContent = `${h}:${m}:${s}`;
     }
 
-    clearInterval(timerInterval);
     timerInterval = setInterval(updateTimer, 1000);
     updateTimer();
 }
 
 function stopTimer() {
     clearInterval(timerInterval);
+    timerInterval = null;
     if (callTimer) {
         callTimer.hidden = true;
         callTimer.textContent = '00:00:00';
@@ -186,31 +177,24 @@ async function disconnectCall(sendSignal = true) {
     stopTimer();
     stopRinging();
 
-    // Stop and remove local tracks
     if (localStream) {
-        localStream.getTracks().forEach(track => {
-            track.stop();
-        });
+        localStream.getTracks().forEach(track => track.stop());
         localStream = null;
     }
 
-    // Clear video elements
     if (localVideo) localVideo.srcObject = null;
     if (remoteVideo) remoteVideo.srcObject = null;
 
     currentCallType = null;
     hideVideoArea();
-    
+
     if (btnAudio) btnAudio.disabled = false;
     if (btnVideo) btnVideo.disabled = false;
 
-    // Send signal to peer before closing PC
     if (sendSignal && sessionKey) {
         socket.emit('end_call_signal', { key: sessionKey });
     }
 
-    // Note: We DON'T close the PeerConnection here to keep DataChannel alive
-    // Only close PC when leaving the session entirely
     appendSystem('Call ended. Chat is still available.');
 }
 
@@ -236,26 +220,22 @@ async function flipCamera() {
         const videoTrack = newStream.getVideoTracks()[0];
         const audioTrack = newStream.getAudioTracks()[0];
 
-        // Replace tracks in peer connection
         const senders = pc.getSenders();
-        const videoSender = senders.find(sender => sender.track && sender.track.kind === 'video');
-        const audioSender = senders.find(sender => sender.track && sender.track.kind === 'audio');
+        const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+        const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
 
-        if (videoSender && videoTrack) {
-            await videoSender.replaceTrack(videoTrack);
-        }
-
+        if (videoSender && videoTrack) await videoSender.replaceTrack(videoTrack);
         if (audioSender && audioTrack) {
-            const wasMuted = localStream.getAudioTracks()[0] ? !localStream.getAudioTracks()[0].enabled : false;
+            const wasMuted = localStream.getAudioTracks()[0]
+                ? !localStream.getAudioTracks()[0].enabled
+                : false;
             await audioSender.replaceTrack(audioTrack);
             audioTrack.enabled = !wasMuted;
         }
 
-        // Stop old tracks
         localStream.getTracks().forEach(track => track.stop());
         localStream = newStream;
         localVideo.srcObject = localStream;
-
         appendSystem('Camera successfully flipped.');
     } catch (err) {
         appendSystem('Failed to flip camera: ' + err.message);
@@ -281,33 +261,19 @@ function handleMaximize() {
         appendSystem('Error: Video container not found.');
         return;
     }
-
-    const isFullscreen = document.fullscreenElement;
-
-    if (isFullscreen) {
-        document.exitFullscreen().catch(err => {
-            appendSystem('Failed to exit fullscreen: ' + err.message);
-        });
+    if (document.fullscreenElement) {
+        document.exitFullscreen().catch(err => appendSystem('Failed to exit fullscreen: ' + err.message));
     } else {
-        remoteVideoContainer.requestFullscreen().then(() => {
-            appendSystem('Video maximized (Fullscreen mode).');
-        }).catch(err => {
-            appendSystem('Failed to enter Fullscreen: ' + err.message);
-        });
+        remoteVideoContainer.requestFullscreen()
+            .then(() => appendSystem('Video maximized (Fullscreen mode).'))
+            .catch(err => appendSystem('Failed to enter Fullscreen: ' + err.message));
     }
 }
 
-// Update button text when fullscreen changes
 document.addEventListener('fullscreenchange', () => {
-    const isFullscreen = document.fullscreenElement;
+    const isFullscreen = !!document.fullscreenElement;
     if (maximizeButton) maximizeButton.textContent = isFullscreen ? 'Minimize' : 'Maximize';
-    if (videoCol) {
-        if (isFullscreen) {
-            videoCol.classList.add('maximized');
-        } else {
-            videoCol.classList.remove('maximized');
-        }
-    }
+    if (videoCol) videoCol.classList.toggle('maximized', isFullscreen);
 });
 
 if (flipCameraButton) flipCameraButton.onclick = flipCamera;
@@ -330,7 +296,6 @@ async function getLocalMedia(constraints) {
         localVideo.srcObject = stream;
 
         if (!constraints.video) {
-            // Audio call: hide videos
             if (localVideo) localVideo.style.display = 'none';
             if (remoteVideo) remoteVideo.style.display = 'none';
             if (muteMicButton) muteMicButton.hidden = false;
@@ -338,7 +303,6 @@ async function getLocalMedia(constraints) {
             if (maximizeButton) maximizeButton.hidden = true;
             if (flipCameraButton) flipCameraButton.hidden = true;
         } else {
-            // Video call: show videos
             if (localVideo) localVideo.style.display = 'block';
             if (remoteVideo) remoteVideo.style.display = 'block';
             if (muteMicButton) muteMicButton.hidden = false;
@@ -349,7 +313,6 @@ async function getLocalMedia(constraints) {
 
         if (muteMicButton) muteMicButton.textContent = 'Mute Mic';
         showVideoArea();
-
         return true;
     } catch (err) {
         console.error('Media error:', err);
@@ -360,15 +323,17 @@ async function getLocalMedia(constraints) {
 }
 
 async function createPeerConnection(mode) {
-    const iceServers = {
+    // FIX: Close existing PC before creating new one
+    if (pc) {
+        pc.close();
+        pc = null;
+    }
+
+    const iceConfig = {
         iceServers: [
-            // STUN servers (for discovering public IP)
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
             { urls: 'stun:stun2.l.google.com:19302' },
-            
-            // TURN servers (for relaying media when direct connection fails)
-            // Free Metered TURN servers
             {
                 urls: 'turn:a.relay.metered.ca:80',
                 username: 'openrelayproject',
@@ -389,18 +354,24 @@ async function createPeerConnection(mode) {
                 username: 'openrelayproject',
                 credential: 'openrelayproject'
             },
-            
-            // Twilio STUN
             { urls: 'stun:global.stun.twilio.com:3478' }
         ],
         iceCandidatePoolSize: 10
     };
 
-    pc = new RTCPeerConnection(iceServers);
+    pc = new RTCPeerConnection(iceConfig);
 
+    // FIX: Single onicecandidate handler (was defined twice before — second overwrote first)
     pc.onicecandidate = e => {
         if (e.candidate) {
+            console.log('ICE Candidate Type:', e.candidate.type, '| Protocol:', e.candidate.protocol);
+            if (e.candidate.type === 'relay') {
+                appendSystem('Using TURN relay server.');
+            }
             socket.emit('ice', { key: sessionKey, candidate: e.candidate });
+        } else {
+            console.log('All ICE candidates sent.');
+            appendSystem('Network discovery complete.');
         }
     };
 
@@ -408,54 +379,51 @@ async function createPeerConnection(mode) {
         console.log('Received remote track:', e.track.kind);
         if (e.streams && e.streams[0]) {
             remoteVideo.srcObject = e.streams[0];
-            
-            // Only start timer if we're in an actual call (audio or video)
-            if (!timerInterval && currentCallType && (currentCallType === 'audio' || currentCallType === 'video')) {
-                startTimer();
-            }
+            // FIX: Start timer on first track received regardless of call type
+            startTimer();
             appendSystem('Remote stream connected.');
         }
     };
 
     pc.oniceconnectionstatechange = () => {
-        console.log('ICE Connection State:', pc.iceConnectionState);
-        appendSystem('Connection: ' + pc.iceConnectionState);
-        
-        if (pc.iceConnectionState === 'failed') {
-            appendSystem('Connection failed. Trying TURN relay...');
-            // ICE restart to try TURN servers
-            if (pc.restartIce) {
-                pc.restartIce();
-            }
-        } else if (pc.iceConnectionState === 'disconnected') {
+        const state = pc.iceConnectionState;
+        console.log('ICE Connection State:', state);
+        appendSystem('Connection: ' + state);
+
+        if (state === 'failed') {
+            appendSystem('Connection failed. Trying ICE restart...');
+            if (pc.restartIce) pc.restartIce();
+        } else if (state === 'disconnected') {
             appendSystem('Connection lost. Attempting to reconnect...');
-        } else if (pc.iceConnectionState === 'connected') {
+        } else if (state === 'connected') {
             appendSystem('Successfully connected!');
-        }
-    };
-    
-    // Log ICE candidates to see if TURN is being used
-    pc.onicecandidate = e => {
-        if (e.candidate) {
-            console.log('ICE Candidate Type:', e.candidate.type, '| Protocol:', e.candidate.protocol);
-            if (e.candidate.type === 'relay') {
-                appendSystem('Using TURN relay server (for long distance)');
-            }
-            socket.emit('ice', { key: sessionKey, candidate: e.candidate });
-        } else {
-            console.log('All ICE candidates sent');
+            // FIX: Also start timer here for audio calls where ontrack may not fire
+            if (currentCallType) startTimer();
         }
     };
 
     pc.onsignalingstatechange = () => {
         console.log('Signaling State:', pc.signalingState);
     };
-    
-    // Monitor ICE gathering state
+
     pc.onicegatheringstatechange = () => {
         console.log('ICE Gathering State:', pc.iceGatheringState);
-        if (pc.iceGatheringState === 'complete') {
-            appendSystem('Network discovery complete.');
+    };
+
+    // FIX: Guard against unexpected renegotiation offers
+    pc.onnegotiationneeded = async () => {
+        if (!isCaller || isNegotiating) return;
+        isNegotiating = true;
+        try {
+            const offer = await pc.createOffer();
+            if (pc.signalingState !== 'stable') return;
+            await pc.setLocalDescription(offer);
+            socket.emit('offer', { key: sessionKey, sdp: pc.localDescription });
+            console.log('Negotiation offer sent');
+        } catch (e) {
+            console.error('Negotiation failed:', e);
+        } finally {
+            isNegotiating = false;
         }
     };
 
@@ -474,21 +442,23 @@ async function createPeerConnection(mode) {
 
 function setupDataChannel() {
     if (!dataChannel) return;
-    
+
     dataChannel.onopen = () => {
         console.log('Data channel opened');
-        appendSystem('Chat ready.');
+        appendSystem('Chat ready. You can now send messages.');
+        // FIX: Enable chat button when data channel is open
+        if (btnChat) btnChat.disabled = false;
     };
-    
+
     dataChannel.onmessage = ev => {
         appendChat(ev.data, false);
     };
-    
+
     dataChannel.onerror = e => {
         console.error('Data Channel Error:', e);
         appendSystem('Chat error occurred.');
     };
-    
+
     dataChannel.onclose = () => {
         console.log('Data channel closed');
         appendSystem('Chat closed.');
@@ -499,28 +469,44 @@ function setupDataChannel() {
 // SOCKET HANDLERS
 // =================================================================
 
+// FIX: Generate key with user feedback
 if (genKeyBtn) {
-    genKeyBtn.onclick = () => socket.emit('generate_key');
+    genKeyBtn.onclick = () => {
+        genKeyBtn.disabled = true;
+        genKeyBtn.textContent = 'Generating...';
+        socket.emit('generate_key');
+        // Re-enable after timeout in case server doesn't respond
+        setTimeout(() => {
+            genKeyBtn.disabled = false;
+            genKeyBtn.textContent = t('genKey');
+        }, 5000);
+    };
 }
 
 socket.on('key_generated', d => {
     sessionKey = d.key;
     if (sessionKeySpan) sessionKeySpan.textContent = sessionKey;
     if (sessionArea) sessionArea.hidden = false;
+    if (genKeyBtn) {
+        genKeyBtn.disabled = false;
+        genKeyBtn.textContent = t('genKey');
+    }
     socket.emit('join_key', { key: sessionKey });
+    appendSystem('Session key generated: ' + sessionKey);
 });
 
 if (joinBtn) {
     joinBtn.onclick = () => {
         const key = keyInput.value.trim().toUpperCase();
-        if (!key) return appendSystem('Error: Enter key');
+        if (!key) return appendSystem('Error: Please enter a session key.');
         sessionKey = key;
         socket.emit('join_key', { key });
     };
 }
 
 socket.on('join_error', d => {
-    appendSystem('Join error: ' + (d.reason || 'unknown'));
+    appendSystem('Join error: ' + (d.reason || 'Unknown error. Check the key and try again.'));
+    sessionKey = null;
 });
 
 socket.on('joined', async d => {
@@ -528,80 +514,105 @@ socket.on('joined', async d => {
     if (sessionArea) sessionArea.hidden = false;
     appendSystem('Connected to session: ' + sessionKey);
 
-    if (!pc) {
-        isCaller = d.peers === 1;
-        await createPeerConnection(isCaller ? 'caller' : 'receiver');
-        appendSystem(isCaller ? 'You are the host.' : 'Joined as peer.');
-    }
+    // FIX: Always create a fresh PC on join
+    isCaller = d.peers === 1;
+    await createPeerConnection(isCaller ? 'caller' : 'receiver');
+    appendSystem(isCaller ? 'You are the host. Waiting for peer...' : 'Joined as peer.');
 });
 
 socket.on('peer_joined', () => {
-    appendSystem('Peer joined.');
+    appendSystem('Peer joined the session.');
 });
 
 socket.on('start_call', async () => {
     appendSystem('Peer ready. Establishing data channel...');
     if (pc && isCaller && dataChannel) {
         try {
+            // FIX: Check signaling state before creating offer
+            if (pc.signalingState !== 'stable') {
+                appendSystem('Cannot create offer: connection not stable.');
+                return;
+            }
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             socket.emit('offer', { key: sessionKey, sdp: pc.localDescription });
             console.log('Initial offer sent');
         } catch (e) {
             console.error('Offer creation failed:', e);
-            appendSystem('Failed to create connection offer.');
+            appendSystem('Failed to create connection offer: ' + e.message);
         }
     }
 });
 
 socket.on('offer', async d => {
     if (!d.sdp || !pc) return;
-    
+
     try {
-        console.log('Received offer, setting remote description');
-        await pc.setRemoteDescription(new RTCSessionDescription(d.sdp));
-        
-        // Add local tracks if available
+        console.log('Received offer, signaling state:', pc.signalingState);
+
+        // FIX: Handle offer collision
+        if (pc.signalingState !== 'stable') {
+            appendSystem('Offer received in wrong state, rolling back...');
+            await Promise.all([
+                pc.setLocalDescription({ type: 'rollback' }),
+                pc.setRemoteDescription(new RTCSessionDescription(d.sdp))
+            ]);
+        } else {
+            await pc.setRemoteDescription(new RTCSessionDescription(d.sdp));
+        }
+
+        // Add local tracks if a call is in progress
         if (localStream) {
             localStream.getTracks().forEach(track => {
-                const senders = pc.getSenders();
-                const exists = senders.find(s => s.track && s.track.kind === track.kind);
+                const exists = pc.getSenders().find(s => s.track && s.track.kind === track.kind);
                 if (!exists) {
                     pc.addTrack(track, localStream);
                     console.log('Added', track.kind, 'track to PC');
                 }
             });
         }
-        
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit('answer', { key: sessionKey, sdp: pc.localDescription });
         console.log('Answer sent');
-        appendSystem('Connection answer sent.');
+        isNegotiating = false;
     } catch (e) {
         console.error('Error handling offer:', e);
-        appendSystem('Error processing connection offer.');
+        appendSystem('Error processing connection offer: ' + e.message);
+        isNegotiating = false;
     }
 });
 
 socket.on('answer', async d => {
     if (!d.sdp || !pc) return;
-    
+
     try {
-        console.log('Received answer');
+        // FIX: Only set remote description if we're expecting an answer
+        if (pc.signalingState !== 'have-local-offer') {
+            console.warn('Received answer in wrong state:', pc.signalingState);
+            return;
+        }
         await pc.setRemoteDescription(new RTCSessionDescription(d.sdp));
+        isNegotiating = false;
         appendSystem('Connection established.');
     } catch (e) {
         console.error('Error handling answer:', e);
-        appendSystem('Error processing connection answer.');
+        appendSystem('Error processing connection answer: ' + e.message);
+        isNegotiating = false;
     }
 });
 
 socket.on('ice', async d => {
     if (d.candidate && pc) {
         try {
-            await pc.addIceCandidate(new RTCIceCandidate(d.candidate));
-            console.log('ICE candidate added');
+            // FIX: Only add ICE candidate if remote description is set
+            if (pc.remoteDescription && pc.remoteDescription.type) {
+                await pc.addIceCandidate(new RTCIceCandidate(d.candidate));
+                console.log('ICE candidate added');
+            } else {
+                console.warn('Remote description not set yet, skipping ICE candidate');
+            }
         } catch (e) {
             console.warn('ICE candidate error:', e);
         }
@@ -610,19 +621,20 @@ socket.on('ice', async d => {
 
 socket.on('peer_left', () => {
     appendSystem('Peer left the session.');
-    
-    // Clean up everything
+
+    // FIX: Disconnect call first, then close PC
     disconnectCall(false);
-    
-    if (pc) {
-        pc.close();
-        pc = null;
+
+    setTimeout(() => {
+        if (pc) {
+            pc.close();
+            pc = null;
+        }
         dataChannel = null;
-    }
-    
-    if (sessionArea) sessionArea.hidden = true;
-    sessionKey = null;
-    isCaller = false;
+        if (sessionArea) sessionArea.hidden = true;
+        sessionKey = null;
+        isCaller = false;
+    }, 300);
 });
 
 socket.on('end_call_signal', () => {
@@ -632,50 +644,61 @@ socket.on('end_call_signal', () => {
 });
 
 socket.on('incoming_call', async d => {
-    // Check if already in a call
     if (localStream) {
         socket.emit('reject_call', { key: sessionKey, reason: 'busy' });
+        appendSystem('Auto-rejected: already in a call.');
         return;
     }
-    
-    // Ensure peer connection exists
+
     if (!pc) {
         isCaller = false;
         await createPeerConnection('receiver');
     }
 
     currentCallType = d.callType;
-    const message = d.callType === 'video' ? 'Incoming Video Call...' : 'Incoming Audio Call...';
+    const message = d.callType === 'video' ? '📹 Incoming Video Call...' : '🔊 Incoming Audio Call...';
     showCallControls(message);
     appendSystem(message);
     startRinging();
 });
 
+// FIX: accept_call — caller gets media then sends offer
 socket.on('accept_call', async () => {
     appendSystem('Call accepted. Starting media...');
     hideCallControls();
-    
-    const success = await getLocalMedia({ 
-        audio: true, 
-        video: currentCallType === 'video' 
+    stopRinging();
+
+    const success = await getLocalMedia({
+        audio: true,
+        video: currentCallType === 'video'
     });
-    
+
     if (success && localStream && pc) {
-        // Add tracks to peer connection
+        // Remove existing senders to avoid duplicates
+        const existingSenders = pc.getSenders();
+        existingSenders.forEach(sender => {
+            if (sender.track) pc.removeTrack(sender);
+        });
+
         localStream.getTracks().forEach(track => {
             pc.addTrack(track, localStream);
-            console.log('Added', track.kind, 'track after acceptance');
+            console.log('Added', track.kind, 'track after call acceptance');
         });
-        
-        // Create and send offer with media
+
         try {
+            if (pc.signalingState !== 'stable') {
+                appendSystem('Waiting for stable state...');
+                return;
+            }
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             socket.emit('offer', { key: sessionKey, sdp: pc.localDescription });
-            console.log('Media offer sent');
+            console.log('Media offer sent after accept');
+            // FIX: Start timer for caller side (audio call)
+            if (currentCallType === 'audio') startTimer();
         } catch (e) {
             console.error('Failed to create media offer:', e);
-            appendSystem('Failed to establish media connection.');
+            appendSystem('Failed to establish media connection: ' + e.message);
             disconnectCall(true);
         }
     } else {
@@ -685,7 +708,7 @@ socket.on('accept_call', async () => {
 });
 
 socket.on('reject_call', d => {
-    appendSystem(`Call rejected: ${d.reason || 'No reason'}`);
+    appendSystem(`Call rejected: ${d.reason || 'No reason given'}`);
     hideCallControls();
     if (btnAudio) btnAudio.disabled = false;
     if (btnVideo) btnVideo.disabled = false;
@@ -700,22 +723,23 @@ socket.on('reject_call', d => {
 if (btnReceiveCall) {
     btnReceiveCall.onclick = async () => {
         if (!currentCallType) return;
-        
+
         stopRinging();
         appendSystem('Accepting call...');
-        
+
         const success = await getLocalMedia({
             audio: true,
             video: currentCallType === 'video'
         });
-        
+
         if (success && localStream && pc) {
-            // Add tracks to peer connection
             localStream.getTracks().forEach(track => {
-                pc.addTrack(track, localStream);
-                console.log('Added', track.kind, 'track');
+                const exists = pc.getSenders().find(s => s.track && s.track.kind === track.kind);
+                if (!exists) {
+                    pc.addTrack(track, localStream);
+                    console.log('Added', track.kind, 'track on receive');
+                }
             });
-            
             socket.emit('accept_call', { key: sessionKey });
             hideCallControls();
         } else {
@@ -760,25 +784,24 @@ function switchLang(l) {
 }
 switchLang('en');
 
-if (btnReload) {
-    btnReload.onclick = () => window.location.reload();
-}
+if (btnReload) btnReload.onclick = () => window.location.reload();
 
 if (keyInput) {
-    keyInput.addEventListener('input', function() {
+    keyInput.addEventListener('input', function () {
         this.value = this.value.toUpperCase();
+    });
+    // FIX: Allow pressing Enter to join
+    keyInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && joinBtn) joinBtn.click();
     });
 }
 
 if (copyKeyBtn) {
     copyKeyBtn.onclick = () => {
         if (sessionKey) {
-            navigator.clipboard.writeText(sessionKey).then(() => {
-                appendSystem('Session key copied to clipboard!');
-            }).catch(err => {
-                console.error('Copy failed:', err);
-                appendSystem('Failed to copy key.');
-            });
+            navigator.clipboard.writeText(sessionKey)
+                .then(() => appendSystem('Session key copied to clipboard!'))
+                .catch(err => appendSystem('Failed to copy key: ' + err.message));
         }
     };
 }
@@ -786,7 +809,7 @@ if (copyKeyBtn) {
 if (btnChat) {
     btnChat.onclick = () => {
         if (!dataChannel || dataChannel.readyState !== 'open') {
-            appendSystem('Chat not ready. Establish connection first.');
+            appendSystem('Chat not ready yet. Wait for peer to connect.');
         } else {
             appendSystem('Chat is active and ready.');
         }
@@ -795,73 +818,50 @@ if (btnChat) {
 
 if (btnAudio) {
     btnAudio.onclick = async () => {
-        if (!pc || !sessionKey) {
-            appendSystem('Please join a session first.');
-            return;
-        }
-        
-        if (!isCaller) {
-            appendSystem('Only the host can initiate calls.');
-            return;
-        }
-        
-        if (localStream) {
-            appendSystem('Call already in progress.');
-            return;
-        }
-        
+        if (!pc || !sessionKey) return appendSystem('Please join a session first.');
+        if (!isCaller) return appendSystem('Only the host can initiate calls.');
+        if (localStream) return appendSystem('Call already in progress.');
+
         currentCallType = 'audio';
         appendSystem('Initiating audio call...');
         socket.emit('incoming_call', { key: sessionKey, callType: 'audio' });
         btnAudio.disabled = true;
-        btnVideo.disabled = true;
+        if (btnVideo) btnVideo.disabled = true;
     };
 }
 
 if (btnVideo) {
     btnVideo.onclick = async () => {
-        if (!pc || !sessionKey) {
-            appendSystem('Please join a session first.');
-            return;
-        }
-        
-        if (!isCaller) {
-            appendSystem('Only the host can initiate calls.');
-            return;
-        }
-        
-        if (localStream) {
-            appendSystem('Call already in progress.');
-            return;
-        }
-        
+        if (!pc || !sessionKey) return appendSystem('Please join a session first.');
+        if (!isCaller) return appendSystem('Only the host can initiate calls.');
+        if (localStream) return appendSystem('Call already in progress.');
+
         currentCallType = 'video';
         appendSystem('Initiating video call...');
         socket.emit('incoming_call', { key: sessionKey, callType: 'video' });
-        btnAudio.disabled = true;
+        if (btnAudio) btnAudio.disabled = true;
         btnVideo.disabled = true;
     };
 }
 
 if (btnLeave) {
     btnLeave.onclick = () => {
-        // End call first
         disconnectCall(true);
-        
-        // Then close everything
+
         if (pc) {
             pc.close();
             pc = null;
             dataChannel = null;
         }
-        
+
         hideVideoArea();
         hideCallControls();
         stopRinging();
         stopTimer();
         currentCallType = null;
         isCaller = false;
-        
+        isNegotiating = false;
+
         if (sessionKey) {
             socket.emit('leave_key', { key: sessionKey });
             sessionKey = null;
@@ -875,19 +875,19 @@ if (sendMsg) {
     sendMsg.onclick = () => {
         const v = chatMsg.value.trim();
         if (!v) return;
-        
+
         if (!dataChannel || dataChannel.readyState !== 'open') {
-            appendSystem('Chat not ready. Data channel is closed.');
+            appendSystem('Chat not ready. Data channel is not open.');
             return;
         }
-        
+
         try {
             dataChannel.send(v);
             appendChat(v, true);
             chatMsg.value = '';
         } catch (e) {
             console.error('Failed to send message:', e);
-            appendSystem('Failed to send message.');
+            appendSystem('Failed to send message: ' + e.message);
         }
     };
 }
@@ -901,10 +901,12 @@ if (chatMsg) {
     });
 }
 
-// UI Helper Functions
+// =================================================================
+// UI HELPER FUNCTIONS
+// =================================================================
+
 function appendChat(text, me) {
     if (!chatBox) return;
-    
     const div = document.createElement('div');
     div.className = 'chat-msg' + (me ? ' me' : '');
     div.textContent = (me ? t('sending') : '') + text;
@@ -914,7 +916,6 @@ function appendChat(text, me) {
 
 function appendSystem(text) {
     if (!chatBox) return;
-    
     const div = document.createElement('div');
     div.className = 'chat-msg system';
     div.style.opacity = '0.6';
@@ -922,22 +923,18 @@ function appendSystem(text) {
     div.textContent = '• ' + text;
     chatBox.appendChild(div);
     chatBox.scrollTop = chatBox.scrollHeight;
-    
     console.log('[System]', text);
 }
 
-// Cleanup on page unload
+// =================================================================
+// CLEANUP ON PAGE UNLOAD
+// =================================================================
+
 window.addEventListener('beforeunload', () => {
     try {
-        if (localStream) {
-            localStream.getTracks().forEach(track => track.stop());
-        }
-        if (sessionKey) {
-            socket.emit('leave_key', { key: sessionKey });
-        }
-        if (pc) {
-            pc.close();
-        }
+        if (localStream) localStream.getTracks().forEach(track => track.stop());
+        if (sessionKey) socket.emit('leave_key', { key: sessionKey });
+        if (pc) pc.close();
         socket.close();
     } catch (e) {
         console.error('Cleanup error:', e);
