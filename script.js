@@ -525,29 +525,28 @@ socket.on('peer_joined', () => {
 });
 
 socket.on('start_call', async () => {
-    appendSystem('Peer ready. Establishing data channel...');
+    appendSystem('Peer ready. Establishing connection...');
 
-    // FIX: Wait for PC to reach stable state before creating offer
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    if (!isCaller || !pc) return;
 
-    if (pc && isCaller && dataChannel) {
-        try {
-            if (pc.signalingState !== 'stable') {
-                appendSystem('Connection not stable yet, retrying...');
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-            if (pc.signalingState !== 'stable') {
-                appendSystem('Cannot create offer: connection not stable.');
-                return;
-            }
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('offer', { key: sessionKey, sdp: pc.localDescription });
-            console.log('Initial offer sent');
-        } catch (e) {
-            console.error('Offer creation failed:', e);
-            appendSystem('Failed to create connection offer: ' + e.message);
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    try {
+        if (pc.signalingState !== 'stable') {
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
+        if (pc.signalingState !== 'stable') {
+            appendSystem('Cannot create offer: not stable. Please reload.');
+            return;
+        }
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('offer', { key: sessionKey, sdp: pc.localDescription });
+        appendSystem('Connection offer sent...');
+        console.log('Initial offer sent');
+    } catch (e) {
+        console.error('Offer creation failed:', e);
+        appendSystem('Failed to create offer: ' + e.message);
     }
 });
 
