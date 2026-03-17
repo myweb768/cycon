@@ -526,9 +526,16 @@ socket.on('peer_joined', () => {
 
 socket.on('start_call', async () => {
     appendSystem('Peer ready. Establishing data channel...');
+
+    // FIX: Wait for PC to reach stable state before creating offer
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
     if (pc && isCaller && dataChannel) {
         try {
-            // FIX: Check signaling state before creating offer
+            if (pc.signalingState !== 'stable') {
+                appendSystem('Connection not stable yet, retrying...');
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
             if (pc.signalingState !== 'stable') {
                 appendSystem('Cannot create offer: connection not stable.');
                 return;
