@@ -1,13 +1,3 @@
-// frontend/script.js - FULLY FIXED VERSION
-// Fixes:
-// 1. onicecandidate defined twice (overwrite bug) → merged into one
-// 2. Key generation feedback added
-// 3. Chat DataChannel readyState check improved
-// 4. Timer starts correctly for both audio and video
-// 5. accept_call flow fixed (caller gets media before sending offer)
-// 6. peer_left cleanup order fixed
-// 7. Renegotiation guard added to prevent duplicate offers
-
 // =================================================================
 // GLOBALS & LANGUAGE
 // =================================================================
@@ -410,21 +400,10 @@ async function createPeerConnection(mode) {
         console.log('ICE Gathering State:', pc.iceGatheringState);
     };
 
-    // FIX: Guard against unexpected renegotiation offers
-    pc.onnegotiationneeded = async () => {
-        if (!isCaller || isNegotiating) return;
-        isNegotiating = true;
-        try {
-            const offer = await pc.createOffer();
-            if (pc.signalingState !== 'stable') return;
-            await pc.setLocalDescription(offer);
-            socket.emit('offer', { key: sessionKey, sdp: pc.localDescription });
-            console.log('Negotiation offer sent');
-        } catch (e) {
-            console.error('Negotiation failed:', e);
-        } finally {
-            isNegotiating = false;
-        }
+    // Negotiation is handled manually via start_call event
+    // Do NOT use onnegotiationneeded to avoid race conditions
+    pc.onnegotiationneeded = () => {
+        console.log('onnegotiationneeded fired - ignored, handled by start_call');
     };
 
     if (mode === 'caller') {
