@@ -1,3 +1,6 @@
+import gevent.monkey
+gevent.monkey.patch_all()  # MUST be first before any other imports
+
 import os
 import random
 import string
@@ -10,14 +13,14 @@ from flask_cors import CORS
 app = Flask(__name__, static_folder='.', static_url_path='')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'neon_secret_123')
 
-# CORS for frontend on Vercel
+# CORS
 CORS(app, origins="*")
 
-# SocketIO with eventlet
+# SocketIO with gevent
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode='eventlet',
+    async_mode='gevent',
     ping_timeout=60,
     ping_interval=25
 )
